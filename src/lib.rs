@@ -11,6 +11,8 @@
 extern crate rppal;
 extern crate libc;
 
+use std::mem::MaybeUninit;
+
 use std::ptr::read_volatile;
 use std::ptr::write_volatile;
 
@@ -23,8 +25,7 @@ use rppal::gpio::Mode;
 
 use libc::SCHED_FIFO;
 use libc::SCHED_OTHER;
-use libc::sched_setscheduler;
-use libc::sched_param;
+use libc::SYS_sched_setscheduler;
 
 /// A temperature and humidity reading from the DHT22.
 #[derive(Debug, Clone, Copy)]
@@ -64,28 +65,31 @@ fn tiny_sleep() {
     }
 }
 
-fn set_max_priority() {
-    unsafe {
-        let param = sched_param {
-            sched_priority: 32
-        };
-        let result = sched_setscheduler(0, SCHED_FIFO, &param);
-
-        if result != 0 {
-            panic!("Error setting priority, you may not have cap_sys_nice capability");
-        }
-    }
+enum PriorityMode {
+    Default,
+    Max,
 }
 
-fn set_default_priority() {
-    unsafe {
-        let param = sched_param {
-            sched_priority: 0
-        };
-        let result = sched_setscheduler(0, SCHED_OTHER, &param);
+fn set_scheduler_priority(mode: PriorityMode) {
+    let (policy, priority) = match mode {
+        PriorityMode::Default => (SCHED_OTHER, 0),
+        PriorityMode::Max => (SCHED_FIFO, 32),
+    };
 
-        if result != 0 {
-            panic!("Error setting priority, you may not have cap_sys_nice capability");
+    unsafe {
+        let mut param = MaybeUninit::<libc::sched_param>::zeroed().assume_init();
+        param.sched_priority = priority;
+
+        let result = libc::syscall(SYS_sched_setscheduler, 0, policy, &param as *const libc::sched_param);
+        match result {
+            0 => (),
+            _ => {
+                let raw_os_error = std::io::Error::last_os_error().raw_os_error();
+                match raw_os_error {
+                    Some(libc::EPERM) => panic!("failed to set thread priority (EPERM), ensure the process has CAP_SYS_NICE capability"),
+                    _ => panic!("failed to set thread priority, error code: {:?}", raw_os_error)
+                }
+            }
         }
     }
 }
@@ -153,7 +157,7 @@ pub fn read(pin: u8) -> Result<Reading, ReadingError> {
 
     let mut pulse_counts: [usize; DHT_PULSES*2] = [0; DHT_PULSES * 2];
                                                                       
-    set_max_priority(); 
+    set_scheduler_priority(PriorityMode::Max); 
 
     gpio.write(Level::High);
     sleep(Duration::from_millis(500));
@@ -197,7 +201,7 @@ pub fn read(pin: u8) -> Result<Reading, ReadingError> {
         }
     }
 
-    set_default_priority();
+    set_scheduler_priority(PriorityMode::Default);
 
     decode(pulse_counts)
 }
